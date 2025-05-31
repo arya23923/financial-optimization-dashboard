@@ -1,102 +1,113 @@
-# Macro-Aware Portfolio Optimization Dashboard (Streamlit Version)
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from pypfopt import EfficientFrontier, risk_models, expected_returns
+from scipy.optimize import minimize
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-import seaborn as sns
-from fredapi import Fred
-import datetime
 
-# Configuration
-st.set_page_config(layout="wide")
-st.title("Macroeconomic-Aware Portfolio Optimization Dashboard")
+st.set_page_config(page_title="Financial Risk Analysis Dashboard", layout="wide")
 
-# API Setup
-FRED_API_KEY = "738a82a300b9041f99eba89da37e14c8"  # Replace with your FRED key
-fred = Fred(api_key=FRED_API_KEY)
-
-# Sidebar Inputs
+# Sidebar Configuration
 st.sidebar.header("Portfolio Configuration")
-tickers = [t.strip().upper() for t in st.sidebar.text_input("Enter comma-separated stock tickers", "AAPL, MSFT, GOOGL, AMZN").split(',')]
-start_date = st.sidebar.date_input("Start Date", datetime.date(2020, 1, 1))
-end_date = st.sidebar.date_input("End Date", datetime.date.today())
 
-# Fetch Financial Data
-def load_data(tickers, start, end):
-    data = yf.download(tickers, start=start, end=end)['Close']  # use 'Close' instead of 'Adj Close'
-    return data.dropna()
+start_date = st.sidebar.date_input("Start Date", datetime.today() - timedelta(days=5*365))
+end_date = st.sidebar.date_input("End Date", datetime.today())
 
+tickers_input = st.sidebar.text_area("Enter Stock Tickers (one per line)", "AAPL\nMSFT\nGOOG")
+tickers = [ticker.strip().upper() for ticker in tickers_input.splitlines() if ticker.strip()]
 
-prices = load_data(tickers, start_date, end_date)
+risk_free_rate_input = st.sidebar.number_input("Risk-Free Rate (%)", value=2.0) / 100
 
-if prices.empty or prices.isnull().all().all():
-    st.error("No valid price data loaded. Please check the tickers and date range.")
-    st.stop()
+submit = st.sidebar.button("Submit Tickers")
 
-returns = prices.pct_change().dropna()
+if submit and len(tickers) > 1:
+    st.title("Financial Risk Analysis Dashboard")
 
-# Fetch Macroeconomic Data
-def get_macro_data():
-    gdp = fred.get_series("GDP", observation_start=start_date)
-    cpi = fred.get_series("CPIAUCSL", observation_start=start_date)
-    unemployment = fred.get_series("UNRATE", observation_start=start_date)
-    rates = fred.get_series("FEDFUNDS", observation_start=start_date)
-    df = pd.concat([gdp, cpi, unemployment, rates], axis=1)
-    df.columns = ["GDP", "CPI", "Unemployment", "FedFunds"]
-    return df.dropna()
+    # Fetch price data
+    adj_close_df = pd.DataFrame()
+    for ticker in tickers:
+        data = yf.download(ticker, start=start_date, end=end_date, auto_adjust=False)
+        adj_close_df[ticker] = data['Adj Close']
 
-macro_df = get_macro_data()
+    # Log Returns
+    log_returns = np.log(adj_close_df / adj_close_df.shift(1)).dropna()
 
-# Display raw data
-with st.expander("Raw Financial Data"):
-    st.dataframe(prices)
+    # Covariance matrix
+    cov_matrix = log_returns.cov() * 252
 
-with st.expander("Macroeconomic Indicators"):
-    st.dataframe(macro_df)
+    # Portfolio functions
+    def standard_deviation(weights):
+        return np.sqrt(weights.T @ cov_matrix @ weights)
 
-# Portfolio Optimization
-st.subheader("Efficient Frontier Optimization")
-mu = expected_returns.mean_historical_return(prices)
-S = risk_models.sample_cov(prices)
-ef = EfficientFrontier(mu, S)
-weights = ef.max_sharpe(risk_free_rate=0.0)
-cleaned_weights = ef.clean_weights()
-perf = ef.portfolio_performance(verbose=True)
+    def expected_return(weights):
+        return np.sum(log_returns.mean() * weights) * 252
 
-# Show weights and performance
-st.write("### Optimized Portfolio Weights")
-st.write(cleaned_weights)
-st.write("### Portfolio Performance")
-st.write(f"Expected annual return: {perf[0]:.2f}")
-st.write(f"Annual volatility: {perf[1]:.2f}")
-st.write(f"Sharpe Ratio: {perf[2]:.2f}")
+    def sharpe_ratio(weights):
+        return (expected_return(weights) - risk_free_rate_input) / standard_deviation(weights)
 
-# Visualize weights
-fig, ax = plt.subplots()
-ax.pie(cleaned_weights.values(), labels=cleaned_weights.keys(), autopct='%1.1f%%')
-ax.set_title("Asset Allocation")
-st.pyplot(fig)
+    def neg_sharpe_ratio(weights):
+        return -sharpe_ratio(weights)
 
-# Correlation with Macroeconomic Data
-st.subheader("Correlation with Macroeconomic Indicators")
-macro_monthly = macro_df.resample('M').mean()
-returns_monthly = returns.resample('M').mean()
-avg_returns = returns_monthly.mean(axis=1)
-combined = pd.concat([avg_returns, macro_monthly], axis=1).dropna()
-combined.columns = ["Average Returns", "GDP", "CPI", "Unemployment", "FedFunds"]
-corr = combined.corr()
-st.write(corr)
-sns.heatmap(corr, annot=True, cmap='coolwarm')
-st.pyplot()
+    # Optimization
+    bounds = [(0, 1.0) for _ in tickers]
+    constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+    initial_weights = np.array([1 / len(tickers)] * len(tickers))
 
-# Risk Metrics
-st.subheader("Risk Analysis")
-value_at_risk = np.percentile(returns.sum(axis=1), 5)
-st.write(f"5% Value at Risk (VaR): {value_at_risk:.4f}")
+    result = minimize(neg_sharpe_ratio, initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+    optimal_weights = result.x
 
-# Footer
-st.markdown("---")
-st.caption("Developed with PyPortfolioOpt, FRED API, and Streamlit")
+    # Results
+    st.subheader("Portfolio Summary")
+
+    df_weights = pd.DataFrame({
+        'Ticker': tickers,
+        'Weight (%)': optimal_weights * 100
+    })
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Current Portfolio Allocation")
+        fig1, ax1 = plt.subplots()
+        ax1.pie(optimal_weights, labels=tickers, autopct='%1.1f%%', startangle=90)
+        ax1.axis('equal')
+        st.pyplot(fig1)
+
+    with col2:
+        st.markdown("#### Portfolio Performance Metrics")
+        st.metric("Expected Annual Return", f"{expected_return(optimal_weights):.2%}")
+        st.metric("Annual Volatility", f"{standard_deviation(optimal_weights):.2%}")
+        st.metric("Sharpe Ratio", f"{sharpe_ratio(optimal_weights):.2f}")
+
+    # Comparison Chart
+    st.subheader("Portfolio Weights Comparison")
+    fig2, ax2 = plt.subplots(figsize = (10,5))
+    bar_width = 0.4
+    bars = ax2.bar(tickers, optimal_weights * 100, color='skyblue', width=bar_width)
+    ax2.set_ylabel("Weight (%)", fontsize=10)
+    ax2.set_title("Optimized Portfolio Allocation", fontsize=10)
+    ax2.tick_params(axis='both', labelsize=10)
+    fig2.tight_layout()
+    st.pyplot(fig2)
+
+    st.markdown("Stock Price Trends (Last 5 Years)")
+    normalized_prices = adj_close_df / adj_close_df.iloc[0] * 100
+    fig_price, ax_price = plt.subplots(figsize=(10, 5))
+
+    
+    for ticker in normalized_prices.columns:
+        ax_price.plot(normalized_prices.index, normalized_prices[ticker], label=ticker)
+
+    ax_price.set_title("Normalized Adjusted Close Prices (Base = 100)")
+    ax_price.set_xlabel("Date")
+    ax_price.set_ylabel("Normalized Price")
+    ax_price.legend(loc="upper left", fontsize="small")
+    ax_price.grid(True)
+
+    # Streamlit chart output
+    st.pyplot(fig_price)
+
+else:
+    st.warning("Enter at least 2 tickers and click 'Submit Tickers'.")
+
